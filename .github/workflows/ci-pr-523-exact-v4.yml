@@ -1,0 +1,70 @@
+on:
+  push:
+    branches: [ ci-pr-523-exact-v4 ]
+
+name: CI PR 523 exact validation v4
+env:
+  RUSTFLAGS: --cfg tokio_unstable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and Display Rust specified toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+      - name: Test with latest nextest release
+        run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
+
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustfmt and clippy
+        run: rustup component add clippy rustfmt
+      - run: cargo fetch
+      - name: rustfmt
+        run: cargo fmt --all -- --check --color always
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  book-test:
+    name: Build book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.4.52,mdbook-linkcheck@0.7.7,mdbook-admonish@1.20.0
+      - name: Build Book
+        run: mdbook build
