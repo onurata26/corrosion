@@ -1,0 +1,29 @@
+on:
+  push:
+    branches: [ fmt-pr-523-final ]
+
+name: Format PR 523 final head
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: issue-503-concurrent-writers
+          fetch-depth: 0
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+      - name: Format workspace
+        run: cargo fmt --all
+      - name: Verify patch
+        run: git diff --check
+      - name: Commit formatter output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --update
+          git commit -m "Format concurrent writer changes"
+          git push origin HEAD:issue-503-concurrent-writers
