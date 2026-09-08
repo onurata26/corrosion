@@ -1101,6 +1101,7 @@ pub(super) struct ChangesActor {
     bookie: Bookie,
     rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     state: HandleChangesState,
+    maintenance_interval: tokio::time::Interval,
     max_seen_cache_len: usize,
     keep_seen_cache_size: usize,
     seen: IndexMap<(ActorId, corro_types::base::CrsqlDbVersion), RangeInclusiveSet<CrsqlSeq>>,
@@ -1113,6 +1114,10 @@ impl ChangesActor {
         rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     ) -> Self {
         let max_queue_len = agent.config().perf.processing_queue_len;
+        let maintenance_duration =
+            Duration::from_millis(agent.config().perf.apply_queue_timeout.max(1) as u64);
+        let mut maintenance_interval = tokio::time::interval(maintenance_duration);
+        maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let state = HandleChangesState::new(
             agent.config().perf.apply_queue_min_batch_size,
@@ -1136,6 +1141,7 @@ impl ChangesActor {
             bookie,
             rx_changes,
             state,
+            maintenance_interval,
             max_seen_cache_len,
             keep_seen_cache_size,
             seen: IndexMap::new(),
@@ -1151,6 +1157,7 @@ impl ChangesActor {
         let bookie = self.bookie.clone();
         let rx_changes = &mut self.rx_changes;
         let state = &mut self.state;
+        let maintenance_interval = &mut self.maintenance_interval;
         let seen = &mut self.seen;
         let max_seen_cache_len = self.max_seen_cache_len;
         let keep_seen_cache_size = self.keep_seen_cache_size;
@@ -1159,6 +1166,25 @@ impl ChangesActor {
         loop {
             let (change, src, original_bcast) = tokio::select! {
                 biased;
+
+                _ = &mut tripwire => {
+                    break;
+                },
+
+                // Keep maintenance running even when full batches disable max_wait.
+                _ = maintenance_interval.tick() => {
+                    gauge!("corro.agent.changes.in_queue").set(state.buf_cost as f64);
+                    gauge!("corro.agent.changesets.in_queue").set(state.queue.len() as f64);
+                    gauge!("corro.agent.changes.processing.jobs")
+                        .set(if state.processing_task.is_some() { 1.0 } else { 0.0 });
+                    metrics_tracker.observe_queue_size(state.queue.len() as u64);
+
+                    if seen.len() > max_seen_cache_len {
+                        seen.drain(..seen.len() - keep_seen_cache_size);
+                    }
+
+                    continue;
+                },
 
                 res = async { state.processing_task.as_mut().unwrap().await }, if state.processing_task.is_some() => {
                     state.handle_task_completion(&agent, &bookie, res);
@@ -1171,25 +1197,9 @@ impl ChangesActor {
                 },
 
                 _ = async { state.max_wait.as_mut().unwrap().await }, if state.max_wait.is_some() => {
-                    gauge!("corro.agent.changes.in_queue").set(state.buf_cost as f64);
-                    gauge!("corro.agent.changesets.in_queue").set(state.queue.len() as f64);
-                    gauge!("corro.agent.changes.processing.jobs")
-                        .set(if state.processing_task.is_some() { 1.0 } else { 0.0 });
-
-                    metrics_tracker.observe_queue_size(state.queue.len() as u64);
-
                     state.handle_timeout(&agent, &bookie);
-
-                    if seen.len() > max_seen_cache_len {
-                        seen.drain(..seen.len() - keep_seen_cache_size);
-                    }
-
                     continue;
                 },
-
-                _ = &mut tripwire => {
-                    break;
-                }
             };
 
             if let Err(error) = change.validate() {
@@ -1860,6 +1870,185 @@ mod tests {
              the seen cache still holds the entry that should have been evicted \
              when the change was dropped from the full queue"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn changes_actor_shutdown_precedes_ready_maintenance_and_input() -> eyre::Result<()> {
+        // A zero batching timeout must also allow the maintenance timer to start.
+        for apply_queue_timeout in [0, 20] {
+            let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+            let dir = tempfile::tempdir()?;
+            let mut config = Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?;
+            config.perf.apply_queue_timeout = apply_queue_timeout;
+            config.perf.processing_queue_len = 1;
+
+            let (agent, agent_options) = setup(config, tripwire.clone()).await?;
+            let bookie = Bookie::new(Default::default());
+            let mut actor = ChangesActor::new(agent.clone(), bookie, agent_options.rx_changes);
+            let other_actor = ActorId(uuid::Uuid::new_v4());
+
+            // The first interval tick is ready and would trim these two keys.
+            for version in 1..=2 {
+                actor
+                    .seen
+                    .insert((other_actor, CrsqlDbVersion(version)), Default::default());
+            }
+            agent
+                .tx_changes()
+                .send((
+                    ChangeV1 {
+                        actor_id: other_actor,
+                        changeset: Changeset::Empty {
+                            versions: dbvr!(3, 3),
+                            ts: Some(agent.clock().new_timestamp().into()),
+                        },
+                    },
+                    ChangeSource::Sync,
+                    None,
+                ))
+                .await?;
+
+            tripwire_tx.send(()).await?;
+            tripwire_worker.await;
+            timeout(Duration::from_secs(1), actor.run(tripwire)).await?;
+
+            assert_eq!(actor.seen.len(), 2, "maintenance ran after shutdown");
+            assert!(
+                actor.rx_changes.try_recv().is_ok(),
+                "queued input was consumed after shutdown"
+            );
+            assert!(actor.state.processing_task.is_none());
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_seen_cache_trim_runs_while_backlogged() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        config.perf.processing_queue_len = 4;
+        config.perf.apply_queue_min_batch_size = 2;
+        config.perf.apply_queue_max_batch_size = 2;
+        config.perf.apply_queue_step_base = 0;
+        config.perf.apply_queue_batch_threshold_ratio = 1.0;
+        config.perf.apply_queue_timeout = 20;
+        // A one-slot channel: every send below returns only once the handler has
+        // taken the previous change, so the queue and the seen cache are already
+        // built up by the time the test sleeps.
+        config.perf.changes_channel_len = 1;
+
+        let (agent, agent_options) = setup(config, tripwire.clone()).await?;
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        // Hold the only write permit. Every batch the handler spawns blocks on
+        // it before it reaches SQLite, so the queue stays backlogged and the
+        // batching timeout stays disarmed for as long as this is held. Nothing
+        // here depends on how long a SQLite busy handler waits.
+        let permit = agent.write_permit().await?;
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        let mut actor = ChangesActor::new(agent.clone(), bookie.clone(), agent_options.rx_changes);
+        let handler = tokio::spawn(async move { actor.run(tripwire).await });
+
+        let change = |version: u64| -> eyre::Result<_> {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(version as i64).into()])?,
+                cid: ColumnName("text".into()),
+                val: format!("version {version}").into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(0),
+                site_id: other_actor.to_bytes(),
+                cl: 1,
+            };
+            Ok((
+                ChangeV1 {
+                    actor_id: other_actor,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(version),
+                        changes: vec![crsql_row],
+                        seqs: dbsr!(0, 0),
+                        last_seq: CrsqlSeq(0),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Sync,
+                None,
+            ))
+        };
+
+        // Versions 1 and 2 are drained into the blocked batch. Versions 3 and 4
+        // are then pushed out of the four-slot queue by 7 and 8. Dropping a full
+        // change takes its sequences out of the seen cache but keeps its key, so
+        // the cache now holds eight keys against a cap of four.
+        for version in 1..=8 {
+            agent.tx_changes().send(change(version)?).await?;
+        }
+
+        // Ten apply timeouts. The batch is still blocked and the queue is still
+        // backlogged for every one of them, so max_wait stays disarmed and only
+        // the maintenance tick can trim the cache.
+        sleep(Duration::from_millis(200)).await;
+        assert!(
+            !bookie
+                .get(&other_actor)
+                .is_some_and(|booked| booked.read().contains_version(&CrsqlDbVersion(3))),
+            "the write permit should keep every batch out of SQLite"
+        );
+
+        // Version 3 was dropped from the queue and is in no batch, so nothing
+        // will ever book it. An empty changeset is deduplicated on the seen-cache
+        // key alone, so this copy survives only if maintenance trimmed the cache
+        // during the backlog.
+        agent
+            .tx_changes()
+            .send((
+                ChangeV1 {
+                    actor_id: other_actor,
+                    changeset: Changeset::Empty {
+                        versions: dbvr!(3, 3),
+                        ts: Some(agent.clock().new_timestamp().into()),
+                    },
+                },
+                ChangeSource::Sync,
+                None,
+            ))
+            .await?;
+
+        drop(permit);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if bookie
+                    .get(&other_actor)
+                    .is_some_and(|booked| booked.read().contains_version(&CrsqlDbVersion(3)))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        handler.await?;
 
         Ok(())
     }
